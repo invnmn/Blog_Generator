@@ -84,7 +84,7 @@ def invoke_claude(prompt):
         return str(e)
 
 # API to Generate Blog Content
-@app.route('/generate', methods=['POST'])
+@app.route('/api/generate', methods=['POST'])
 def generate_blog():
     data = request.json
     user_id = data.get('user_id')
@@ -123,12 +123,12 @@ def generate_blog():
     if not content:
         return jsonify({"error": "Failed to generate content"}), 500
     print("BLOGCONTENT",content)
-    save_to_db(user_id, topic, section, content)
+    # save_to_db(user_id, topic, section, content)
     
     return jsonify({section.lower(): content})
 
 # Function to save content to SQLite
-@app.route('/save_blog', methods=['POST'])
+@app.route('/api/save_blog', methods=['POST'])
 def save_blog():
     data = request.json
     user_id = data.get("user_id")
@@ -161,7 +161,7 @@ def save_blog():
 
 
 # API to Retrieve Blog Content by User ID
-@app.route('/get_blog', methods=['GET'])
+@app.route('/api/get_blog', methods=['GET'])
 def get_blog():
     user_id = request.args.get('user_id')
     if not user_id:
@@ -183,7 +183,7 @@ def get_blog():
     return jsonify({"error": "No blog found"}), 404
 
 
-@app.route('/generate_template', methods=['POST'])
+@app.route('/api/generate_template', methods=['POST'])
 def generate_template():
     """Generate an AI-powered HTML template using AWS Bedrock, then replace placeholders."""
     data = request.json
@@ -233,7 +233,7 @@ def generate_template():
     print("html",filled_template)
     return jsonify({"html": filled_template})
 
-@app.route('/generate_image', methods=['POST'])
+@app.route('/api/generate_image', methods=['POST'])
 def generate_image():
     """Generate an image using AWS Bedrock based on user prompt."""
     data = request.json
@@ -274,7 +274,7 @@ def generate_image():
         print(f"ERROR: Can't generate image. Reason: {e}")
         return jsonify({"error": "Image generation failed"}), 500
 
-@app.route('/static/<filename>')
+@app.route('/api/static/<filename>')
 def serve_image(filename):
     """Serve generated images from output folder."""
     return send_from_directory("output", filename)
@@ -287,7 +287,7 @@ s3 = boto3.client(
 )
 
 # **Route to Upload HTML to S3**
-@app.route('/upload_to_s3', methods=['POST'])
+@app.route('/api/upload_to_s3', methods=['POST'])
 def upload_to_s3():
     try:
         data = request.json
@@ -368,7 +368,7 @@ if __name__ == '__main__':
 #         return str(e)
 
 # # API to Generate Blog Content
-# @app.route('/generate', methods=['POST'])
+# @app.route('/api/generate', methods=['POST'])
 # def generate_blog():
 #     data = request.json
 #     topic = data.get('topic')
@@ -406,7 +406,7 @@ if __name__ == '__main__':
 #     return jsonify(results)
 
 # # API to Save Edited Content
-# @app.route('/save', methods=['POST'])
+# @app.route('/api/save', methods=['POST'])
 # def save_blog():
 #     data = request.json
 #     topic = data["topic"]
@@ -483,7 +483,7 @@ if __name__ == '__main__':
 #         return str(e)
 
 # # Generate blog content
-# @app.route('/generate', methods=['POST'])
+# @app.route('/api/generate', methods=['POST'])
 # def generate_blog():
 #     data = request.json
 #     topic = data.get('topic')
