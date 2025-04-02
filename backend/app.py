@@ -7,7 +7,7 @@ import base64
 import os
 import random
 from flask import send_from_directory
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import NoCredentialsError,ClientError
 
 app = Flask(__name__)
 CORS(app)
@@ -82,7 +82,12 @@ def invoke_claude(prompt):
         return model_response["content"][0]["text"]
     except Exception as e:
         return str(e)
+app.config['WEBPAGE_FOLDER'] = os.path.join(os.getcwd(), 'saved_webpages')  # Define the folder
 
+# Create the directory if it doesn't exist
+if not os.path.exists(app.config['WEBPAGE_FOLDER']):
+    os.makedirs(app.config['WEBPAGE_FOLDER'])
+    
 # API to Generate Blog Content
 @app.route('/api/generate', methods=['POST'])
 def generate_blog():
@@ -261,23 +266,37 @@ def generate_image():
         model_response = json.loads(response["body"].read())
         base64_image_data = model_response["images"][0]
 
-        output_dir = "output"
+        output_dir = "static/uploads"
         os.makedirs(output_dir, exist_ok=True)
 
-        image_path = os.path.join(output_dir, f"generated_image_{seed}.png")
+        image_path = output_dir+f"/generated_image_{seed}.png"
         with open(image_path, "wb") as file:
             file.write(base64.b64decode(base64_image_data))
 
         print(f"The generated image has been saved to {image_path}")
-        return jsonify({"image_url": f"http://localhost:5000/static/{os.path.basename(image_path)}"})
+        # return jsonify({"image_url": f"/static/uploads/{os.path.basename(image_path)}"})
+    
+        image_filename = image_path
+
+
+        # **Upload Image to S3**
+        s3_key = f"static/uploads/{image_filename}"
+        s3_op = s3.upload_file(image_path, AWS_BUCKET_NAME, s3_key, ExtraArgs={"ContentType": "image/png"})
+        print("s3_output",s3_op)
+        # **Get S3 Image URL**
+        s3_image_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{s3_key}"
+        
+
+        return jsonify({"image_url": s3_image_url})
+
     except (ClientError, Exception) as e:
         print(f"ERROR: Can't generate image. Reason: {e}")
         return jsonify({"error": "Image generation failed"}), 500
 
-@app.route('/api/static/<filename>')
+@app.route('/api/static/uploads/<filename>')
 def serve_image(filename):
     """Serve generated images from output folder."""
-    return send_from_directory("output", filename)
+    return f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{filename}"
 
 # **Initialize S3 Client**
 s3 = boto3.client(
@@ -313,212 +332,100 @@ def upload_to_s3():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# **Image Upload Directory Setup**
+UPLOAD_FOLDER = os.path.join(app.root_path, 'static', 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+@app.route('/upload_image', methods=['POST'])
+def upload_image():
+    """Handle image uploads."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files['file']
+    filename = file.filename
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    
+    file.save(file_path)
+    return jsonify({"url": f"/static/uploads/{filename}"})  # Send correct URL to GrapesJS
+
+@app.route('/static/uploads/<filename>')
+def serve_uploaded_file(filename):
+    """Serve uploaded images."""
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# **Route to Save Webpage Code (HTML & CSS)**
+@app.route('/api/save_webpage', methods=['POST'])
+def save_webpage():
+    data = request.json
+    user_id = data.get("user_id")
+    html_content = data.get("html_content")
+
+    if not user_id or not html_content:
+        return jsonify({"error": "Missing user_id or HTML content"}), 400
+    
+    print("WEBPAGE_FOLDER:", app.config.get('WEBPAGE_FOLDER'))  # Debugging line
+
+    # **Generate unique filename**
+    file_path = os.path.join(app.config['WEBPAGE_FOLDER'], f"{user_id}.html")
+
+    try:
+        # **Save the webpage locally**
+        with open(file_path, "w", encoding="utf-8") as file:
+            file.write(html_content)
+
+        return jsonify({"message": "Webpage saved successfully!", "file_path": f"/static/webpages/{user_id}.html"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# **Route to Serve Saved Webpage Locally**
+@app.route('/static/webpages/<filename>')
+def serve_webpage(filename):
+    """Serve saved webpages from the static/webpages directory."""
+    return send_from_directory(app.config['WEBPAGE_FOLDER'], filename)
+
+
+# **Route to Upload Webpage to S3**
+@app.route('/api/upload_webpage_s3', methods=['POST'])
+def upload_webpage_s3():
+    try:
+        data = request.json
+        user_id = data.get("user_id")
+
+        if not user_id:
+            return jsonify({"error": "User ID is required"}), 400
+
+        # **Get saved webpage path**
+        file_path = os.path.join(app.config['WEBPAGE_FOLDER'], f"{user_id}.html")
+
+        # **Check if the file exists**
+        if not os.path.exists(file_path):
+            return jsonify({"error": "Webpage not found!"}), 404
+
+        # **Read the file content**
+        with open(file_path, "r", encoding="utf-8") as file:
+            html_content = file.read()
+
+        # **Generate unique file key for S3**
+        file_key = f"webpages/{user_id}.html"
+
+        # **Upload HTML file to S3**
+        s3.put_object(Bucket=AWS_BUCKET_NAME, Body=html_content, Key=file_key, ContentType="text/html")
+
+        # **Generate S3 URL**
+        s3_url = f"https://{AWS_BUCKET_NAME}.s3.{REGION}.amazonaws.com/{file_key}"
+
+        return jsonify({"message": "Webpage uploaded successfully!", "s3_url": s3_url})
+
+    except NoCredentialsError:
+        return jsonify({"error": "AWS Credentials not found"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 if __name__ == '__main__':
     app.run(debug=True)
-
-
-
-# from flask import Flask, request, jsonify
-# from flask_cors import CORS
-# import sqlite3
-# import json
-# import boto3
-
-# app = Flask(__name__)
-# CORS(app)
-
-# client = boto3.client("bedrock-runtime", region_name="us-east-1")
-# claude_model_id = "anthropic.claude-3-haiku-20240307-v1:0"
-
-# # Initialize DB
-# def init_db():
-#     conn = sqlite3.connect('blog_content.db')
-#     cursor = conn.cursor()
-#     cursor.execute('''
-#     CREATE TABLE IF NOT EXISTS blogs (
-#         id INTEGER PRIMARY KEY AUTOINCREMENT,
-#         topic TEXT,
-#         title TEXT,
-#         intro TEXT,
-#         body TEXT,
-#         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-#         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-#     )''')
-#     conn.commit()
-#     conn.close()
-
-# init_db()
-
-# # Function to invoke Claude AI
-# def invoke_claude(prompt):
-#     try:
-#         response = client.invoke_model(
-#             modelId=claude_model_id, 
-#             body=json.dumps({
-#                 "anthropic_version": "bedrock-2023-05-31",
-#                 "max_tokens": 500,
-#                 "temperature": 0.5,
-#                 "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-#             })
-#         )
-#         model_response = json.loads(response["body"].read())
-#         return model_response["content"][0]["text"]
-#     except Exception as e:
-#         return str(e)
-
-# # API to Generate Blog Content
-# @app.route('/api/generate', methods=['POST'])
-# def generate_blog():
-#     data = request.json
-#     topic = data.get('topic')
-#     section = data.get('section')
-#     additional_prompt = data.get('additionalPrompt', '')
-
-#     prompts = {
-#         "TITLE": f"""\n\nSystem: You are title generating bot which is SEO optimized for a blog.Only output content
-#                  \n\nHuman:"You have to write a short one-liner title for {topic}.***Only content to be generated***.{additional_prompt}
-#                  """,
-#         "INTRODUCTION": f"""\n\nSystem: You are a content generating bot which only generates SEO optimized Introduction.You can use html and css for better visual inside <div class="introduction"><!-- introduction content with html tags goes here --></div>).**Only content to be generated**.
-#                             Human:You have  to write an engaging introduction paragraph for a blog post about {topic}.{additional_prompt}
-                            
-#                     """,
-#         "BODY": f"""\n\nSystem: You are a content-generating bot that strictly follows instructions. Your task is to generate only the **body content** of a blog post without a **TITLE** and **INTRODUCTION** for the topic {topic}.  
-
-#                     - Your response **must only** contain HTML content.  
-#                     - Wrap the content inside:
-#                     <div class="body">
-#                         <!-- body content with html tags goes here -->
-#                     </div>
-                    
-#                 {additional_prompt}
-#             """
-#     }
-
-#     results = {}
-#     if section == "ALL":
-#         for sec, prompt in prompts.items():
-#             print(f"{sec}CCCCCCCCCCCCCCCCCCCCCCC{prompt}")
-#             results[sec.lower()] = invoke_claude(prompt)
-#     else:
-#         results[section.lower()] = invoke_claude(prompts[section])
-#     print(results)
-#     return jsonify(results)
-
-# # API to Save Edited Content
-# @app.route('/api/save', methods=['POST'])
-# def save_blog():
-#     data = request.json
-#     topic = data["topic"]
-#     content = data["content"]
-
-#     conn = sqlite3.connect('blog_content.db')
-#     cursor = conn.cursor()
-
-#     cursor.execute('''
-#     INSERT INTO blogs (topic, title, intro, body, updated_at)
-#     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-#     ON CONFLICT(id) DO UPDATE 
-#     SET title=excluded.title, intro=excluded.intro, body=excluded.body, updated_at=CURRENT_TIMESTAMP
-#     ''', (topic, content["title"], content["introduction"], content["body"]))
-
-#     conn.commit()
-#     conn.close()
-#     return jsonify({"message": "Blog saved successfully!"})
-
-# if __name__ == '__main__':
-#     app.run(debug=True)
-
-
-
-
-# from flask import Flask, request, jsonify
-# from flask_cors import CORS
-# import sqlite3
-# import json
-# import boto3
-
-# app = Flask(__name__)
-# CORS(app)
-
-# # AWS Bedrock Client
-# client = boto3.client("bedrock-runtime", region_name="us-east-1")
-# claude_model_id = "anthropic.claude-3-haiku-20240307-v1:0"
-
-# # Initialize DB
-# def init_db():
-#     conn = sqlite3.connect('blog_content.db')
-#     cursor = conn.cursor()
-#     cursor.execute('''
-#     CREATE TABLE IF NOT EXISTS blogs (
-#         id INTEGER PRIMARY KEY AUTOINCREMENT,
-#         user_id TEXT UNIQUE,
-#         blog_title TEXT,
-#         TITLE TEXT,
-#         INTRODUCTION TEXT,
-#         BODY TEXT,
-#         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-#         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-#     )''')
-#     conn.commit()
-#     conn.close()
-
-# init_db()
-
-# # Function to invoke Claude model
-# def invoke_claude(prompt):
-#     try:
-#         response = client.invoke_model(
-#             modelId=claude_model_id, 
-#             body=json.dumps({
-#                 "anthropic_version": "bedrock-2023-05-31",
-#                 "max_tokens": 500,
-#                 "temperature": 0.5,
-#                 "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-#             })
-#         )
-#         model_response = json.loads(response["body"].read())
-#         return model_response["content"][0]["text"]
-#     except Exception as e:
-#         return str(e)
-
-# # Generate blog content
-# @app.route('/api/generate', methods=['POST'])
-# def generate_blog():
-#     data = request.json
-#     topic = data.get('topic')
-#     section = data.get('section')
-#     additional_prompt = data.get('additionalPrompt', '')
-
-#     prompts = {
-#         "TITLE": f"""\n\nSystem: You are title generating bot which is SEO optimized for a blog.Only output content
-#                  \n\nHuman:"You have to write a short one-liner title for {topic}.***Only content to be generated**.{additional_prompt}
-#                  """,
-#         "INTRODUCTION": f"""\n\nSystem: You are a content generating bot which only generates SEO optimized Introduction.You can use html and css for better visual inside <div class="introduction"><!-- introduction content with html tags goes here --></div>).**Only content to be generated**.
-#                             Human:You have  to write an engaging introduction paragraph for a blog post about {topic}.{additional_prompt}
-                            
-#                     """,
-#         "BODY": f"""\n\nSystem: You are a content-generating bot that strictly follows instructions. Your task is to generate only the **body content** of a blog post without a **TITLE** and **INTRODUCTION** for the topic {topic}.  
-
-#                     - Your response **must only** contain HTML content.  
-#                     - Wrap the content inside:
-#                     <div class="body">
-#                         <!-- body content with html tags goes here -->
-#                     </div>
-                    
-#                 {additional_prompt}
-#             """
-#     }
-
-#     results = {}
-#     if section == "ALL":
-#         for sec, prompt in prompts.items():
-#             print(f"{sec}AAAAAAAAAAA{prompt}")
-#             results[sec.lower()] = invoke_claude(prompt)
-#     else:
-#         results[section.lower()] = invoke_claude(prompts[section])
-#     print(results)
-#     return jsonify(results)
-
-# if __name__ == '__main__':
-#     app.run(debug=True)
