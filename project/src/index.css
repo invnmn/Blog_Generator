@@ -1,3 +1,20 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+.gjs-pn-buttons .btn-generate-blog-content {
+  background-color: #32485f;
+  color: white;
+  padding: 4px 4px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: 30px; /* Space from device icons */
+  display: inline-block;
+  position: relative;
+  z-index: 10;
+}
+
+.gjs-pn-buttons .btn-generate-blog-content:hover {
+  background-color: #0056b3;
+}

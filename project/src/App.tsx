@@ -1,21 +1,25 @@
+// App.tsx
 import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
-import { Toaster } from "react-hot-toast";
-import BlogGenerator from "./components/BlogGenerator";
-import WebpageEditor from "./components/WebpageEditor";
+import { useState } from "react";
 import Navbar from "./components/Navbar";
+import Login from "./components/Login";
+import TopicManager from "./components/TopicManager";
+import WebpageEditor from "./components/WebpageEditor";
 
 function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem("token"));
+
   return (
     <Router>
-      <div className="min-h-screen bg-gray-50">
-        <Navbar />
-        <div className="container mx-auto px-4 py-8">
+      <div className="min-h-screen bg-gray-100">
+        <Navbar isAuthenticated={isAuthenticated} setIsAuthenticated={setIsAuthenticated} />
+        <div className="py-6">
           <Routes>
-            <Route path="/" element={<BlogGenerator />} />
-            <Route path="/editor" element={<WebpageEditor />} />
+            <Route path="/login" element={<Login setIsAuthenticated={setIsAuthenticated} />} />
+            <Route path="/" element={isAuthenticated ? <TopicManager /> : <Login setIsAuthenticated={setIsAuthenticated} />} />
+            <Route path="/editor/:topicId" element={<WebpageEditor />} />
           </Routes>
         </div>
-        <Toaster position="bottom-right" />
       </div>
     </Router>
   );

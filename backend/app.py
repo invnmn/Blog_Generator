@@ -6,259 +6,230 @@ import boto3
 import base64
 import os
 import random
-from flask import send_from_directory
-from botocore.exceptions import NoCredentialsError,ClientError
+import jwt
+from datetime import datetime, timedelta
+from botocore.exceptions import NoCredentialsError, ClientError
+from botocore.config import Config
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 CORS(app)
 REGION = "us-east-1"
-client = boto3.client("bedrock-runtime", region_name=REGION)
-claude_model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+
+try:
+    custom_config = Config(connect_timeout=10, read_timeout=600)
+    client = boto3.client("bedrock-runtime", region_name=REGION, config=custom_config)
+    s3 = boto3.client("s3", region_name=REGION)
+except NoCredentialsError:
+    print("AWS credentials not found. Please configure your AWS credentials.")
+    exit(1)
+
+claude_model_id = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 image_model_id = "amazon.nova-canvas-v1:0"
 AWS_BUCKET_NAME = "webbucket.new"
+SECRET_KEY = "your-secret-key"
 
 # Initialize SQLite Database
 def init_db():
     conn = sqlite3.connect('blog_content.db')
     cursor = conn.cursor()
+
+    # Users table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL
+    )''')
+
+    # Topics table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS topics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        title TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+
+    # Blogs table
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS blogs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT UNIQUE,
+        user_id INTEGER,
+        topic_id INTEGER,
         blog_title TEXT,
-        TITLE TEXT,
-        INTRODUCTION TEXT,
-        BODY TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        title TEXT,
+        introduction TEXT,
+        body TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (topic_id) REFERENCES topics(id)
     )''')
+
+    # Webpages table (store full HTML content)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS webpages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        topic_id INTEGER,
+        html_content TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (topic_id) REFERENCES topics(id)
+    )''')
+
     conn.commit()
     conn.close()
-
-def get_from_db(user_id=None):
-    """Retrieve blog content from SQLite by user_id."""
-    conn = sqlite3.connect('blog_content.db')
-    cursor = conn.cursor()
-
-    if not user_id:
-        conn.close()
-        return None
-
-    cursor.execute('''
-        SELECT blog_title, TITLE, INTRODUCTION, BODY 
-        FROM blogs 
-        WHERE user_id = ?
-    ''', (user_id,))
-
-    result = cursor.fetchone()
-    conn.close()
-
-    if result:
-        return {
-            "blog_title": result[0],
-            "TITLE": result[1] if result[1] else "",
-            "INTRODUCTION": result[2] if result[2] else "",
-            "BODY": result[3] if result[3] else "",
-        }
-    return {}
-
-
 
 init_db()
 
+# Authentication middleware
+def token_required(f):
+    def decorated(*args, **kwargs):
+        token = request.headers.get("Authorization")
+        if not token or not token.startswith("Bearer "):
+            return jsonify({"error": "Token is missing"}), 401
+        try:
+            token = token.split(" ")[1]
+            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+            request.user_id = payload["user_id"]
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token"}), 401
+        return f(*args, **kwargs)
+    decorated.__name__ = f.__name__
+    return decorated
+
+# User Registration
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+                       (username, generate_password_hash(password)))
+        conn.commit()
+        return jsonify({"message": "User registered successfully"}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Username already exists"}), 400
+    finally:
+        conn.close()
+
+# User Login
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    if not user or not check_password_hash(user[1], password):
+        return jsonify({"error": "Invalid credentials"}), 401
+    token = jwt.encode({"user_id": user[0], "exp": datetime.utcnow() + timedelta(hours=24)},
+                       SECRET_KEY, algorithm="HS256")
+    return jsonify({"token": token, "user_id": user[0]})
+
+# Topic Management
+@app.route('/api/topics', methods=['GET', 'POST'])
+@token_required
+def manage_topics():
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    if request.method == 'GET':
+        user_id = request.args.get("user_id")
+        cursor.execute("SELECT id, title FROM topics WHERE user_id = ?", (user_id,))
+        topics = [{"id": row[0], "title": row[1]} for row in cursor.fetchall()]
+        conn.close()
+        return jsonify({"topics": topics})
+    if request.method == 'POST':
+        data = request.json
+        user_id = data.get("user_id")
+        title = data.get("title")
+        cursor.execute("INSERT INTO topics (user_id, title) VALUES (?, ?)", (user_id, title))
+        topic_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"topic_id": topic_id, "message": "Topic created successfully"}), 201
+
 # Function to invoke Claude AI
 def invoke_claude(prompt):
+    messages = [{"role": "user", "content": [{"text": prompt}]}]
+    system_prompts = [{"text": "Try generate the content or code within 4500 tokens"}]
+    inference_config = {"maxTokens": 5000, "temperature": 0.5, "topP": 0.9}
     try:
-        response = client.invoke_model(
-            modelId=claude_model_id, 
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 3000,
-                "temperature": 0.5,
-                "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-            })
+        response = client.converse(
+            modelId=claude_model_id,
+            messages=messages,
+            system=system_prompts,
+            inferenceConfig=inference_config,
         )
-        model_response = json.loads(response["body"].read())
-        return model_response["content"][0]["text"]
+        return response["output"]["message"]["content"][0]["text"]
     except Exception as e:
         return str(e)
-app.config['WEBPAGE_FOLDER'] = os.path.join(os.getcwd(), 'saved_webpages')  # Define the folder
 
-# Create the directory if it doesn't exist
-if not os.path.exists(app.config['WEBPAGE_FOLDER']):
-    os.makedirs(app.config['WEBPAGE_FOLDER'])
-    
-# API to Generate Blog Content
+# Generate/Modify Blog Content
 @app.route('/api/generate', methods=['POST'])
-def generate_blog():
+@token_required
+def generate_or_modify_blog():
     data = request.json
     user_id = data.get('user_id')
-    topic = data.get('topic')
-    print("TOPIC", topic)
-    section = data.get('section')
-    print("SECTION", section)
-    additional_prompt = data.get('additionalPrompt', '')
+    topic_id = data.get('topic_id')
+    content = data.get('content', '')
+    prompt = data.get('prompt')
+    print("Received data:", data)
+    # if not user_id or not topic_id or not prompt:
+    #     return jsonify({"error": "User ID, Topic ID, and prompt are required"}), 400
 
-    if not user_id:
-        return jsonify({"error": "User ID is required"}), 400
+    # conn = sqlite3.connect('blog_content.db')
+    # cursor = conn.cursor()
+    # cursor.execute("SELECT title FROM topics WHERE id = ? AND user_id = ?", (topic_id, user_id))
+    # topic_row = cursor.fetchone()
+    # conn.close()
 
-    prompts = {
-        "TITLE": f"""\n\nSystem: You are title generating bot which is SEO optimized for a blog.Only output content
-                 \n\nHuman:"You have to write a short one-liner title for {topic}.***Only content to be generated***.{additional_prompt}
-                 """,
-        "INTRODUCTION": f"""\n\nSystem: You are a content generating bot which only generates SEO optimized Introduction.You can use html and css for better visual inside <div class="introduction"><!-- introduction content with html tags goes here --></div>).**Only content to be generated**.
-                            Human:You have  to write an engaging introduction paragraph for a blog post about {topic}.{additional_prompt}
-                            
-                    """,
-        "BODY": f"""\n\nSystem: You are a content-generating bot that strictly follows instructions. Your task is to generate only the **body content** of a blog post without a **TITLE** and **INTRODUCTION** for the topic {topic}.  
+    # if not topic_row:
+    #     return jsonify({"error": "Topic not found"}), 404
 
-                    - Your response **must only** contain HTML content.  
-                    - Wrap the content inside:
-                    <div class="body">
-                        <!-- body content with html tags goes here -->
-                    </div>
-                    
-                {additional_prompt}
-            """
-    }
-
-
-    content = invoke_claude(prompts.get(section, ""))
-    print("PROMPT",prompts.get(section, ""))
-    if not content:
-        return jsonify({"error": "Failed to generate content"}), 500
-    print("BLOGCONTENT",content)
-    # save_to_db(user_id, topic, section, content)
+    # topic = topic_row[0]
+    # print("TOPIC",topic)
+    print("CONTENT",content)
     
-    return jsonify({section.lower(): content})
-
-# Function to save content to SQLite
-@app.route('/api/save_blog', methods=['POST'])
-def save_blog():
-    data = request.json
-    user_id = data.get("user_id")
-    blog_title = data.get("blog_title")
-    section = data.get("section")  # TITLE, INTRODUCTION, BODY
-    content = data.get("content")
-
-    if not user_id or not blog_title or not section or not content:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    conn = sqlite3.connect('blog_content.db')
-    cursor = conn.cursor()
-
-    # Check if the blog entry exists
-    cursor.execute("SELECT id FROM blogs WHERE user_id = ?", (user_id,))
-    existing_id = cursor.fetchone()
-
-    if existing_id:
-        # Update existing entry
-        cursor.execute(f"UPDATE blogs SET {section} = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?", (content, user_id))
-    else:
-        # Insert new entry
-        cursor.execute(f"INSERT INTO blogs (user_id, blog_title, {section}, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-                       (user_id, blog_title, content))
-    
-    conn.commit()
-    conn.close()
-
-    return jsonify({"message": "Blog content saved successfully!"})
-
-
-# API to Retrieve Blog Content by User ID
-@app.route('/api/get_blog', methods=['GET'])
-def get_blog():
-    user_id = request.args.get('user_id')
-    if not user_id:
-        return jsonify({"error": "User ID is required"}), 400
-
-    conn = sqlite3.connect('blog_content.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT blog_title, TITLE, INTRODUCTION, BODY FROM blogs WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    print("RESULT",result)
-    if result:
-        return jsonify({
-            "blog_title": result[0],
-            "title": result[1] or "",
-            "intro": result[2] or "",
-            "body": result[3] or "",
-        })
-    return jsonify({"error": "No blog found"}), 404
-
-
-@app.route('/api/generate_template', methods=['POST'])
-def generate_template():
-    """Generate an AI-powered HTML template using AWS Bedrock, then replace placeholders."""
-    data = request.json
-    user_id = data.get("user_id")
-    additional_prompt = data.get("additional_prompt", "")
-
-    if not user_id:
-        return jsonify({"error": "User ID is required"}), 400
-
-    # Fetch blog content from database
-    blog_data = get_from_db(user_id=user_id)
-
-    if not blog_data:
-        return jsonify({"error": "No blog found for this user"}), 404
-
-    # Step 1: Generate HTML template with placeholders
-    prompt = """System: Generate a professional blog webpage template using only HTML and CSS that resembles popular platforms like Medium or LinkedIn articles. The template should include the following placeholders which will be used for adding division blocks:
-                    1. {{TITLE}}
-                    2. {{INTRODUCTION}}
-                    3. {{BODY}}
-
-                Design requirements:
-                - Clean typography with proper spacing and line height for readability.
-                - Proper visual hierarchy to guide readers through the content.
-                - Should be a visually appealing webpage
-
-                Additional elements to include:
-                - Author bio section with avatar placeholder (use {{AVATAR}}, {{AUTHOR_NAME}}, {{AUTHOR_BIO}})
-                - Estimated reading time with placeholder (use {{READING_TIME}})
-
-                Use only HTML and CSS (no JavaScript).
-
-                IMPORTANT: Your response should ONLY contain the complete HTML and CSS code. Any explanations, descriptions, or additional information must be included as HTML comments using the format: <!-- Additional information from the model: explanation here -->
-                                                        """ + f"Human:{additional_prompt}" + "Assistant:Webpage code"
-
-    raw_template = invoke_claude(prompt)
-    print("RAWTEMPLATE",raw_template)
-    if not raw_template:
-        return jsonify({"error": "Failed to generate template"}), 500
-
-    # Step 2: Replace placeholders with actual blog content
-    filled_template = (
-        raw_template.replace("{{TITLE}}", blog_data["TITLE"])
-                    .replace("{{INTRODUCTION}}", blog_data["INTRODUCTION"])
-                    .replace("{{BODY}}", blog_data["BODY"])
+    # Generate or modify content
+    claude_prompt = (
+        f"System: You are a content generation/modification bot. "
+        f"Generate new content if no original content is provided, or modify the provided content based on the prompt. "
+        f"Output only the modified or generated content.\n\n"
+        f"Original content: {content if content else 'No content provided'}\n"
+        f"Prompt: {prompt}"
     )
-    print("html",filled_template)
-    return jsonify({"html": filled_template})
 
+    new_content = invoke_claude(claude_prompt)
+    print(f"Claude response: {new_content}")
+    if not new_content or isinstance(new_content, str) and "error" in new_content.lower():
+        return jsonify({"error": "Failed to generate/modify content"}), 500
+
+
+    return jsonify({'content': new_content})
+
+# Generate Image
 @app.route('/api/generate_image', methods=['POST'])
+@token_required
 def generate_image():
-    """Generate an image using AWS Bedrock based on user prompt."""
     data = request.json
     img_prompt = data.get("prompt", "")
-
+    print("Received data:", data)
     if not img_prompt:
         return jsonify({"error": "Prompt is required"}), 400
 
     seed = random.randint(0, 858993460)
-
     native_request = {
         "taskType": "TEXT_IMAGE",
         "textToImageParams": {"text": img_prompt},
-        "imageGenerationConfig": {
-            "seed": seed,
-            "quality": "standard",
-            "height": 400,
-            "width": 800,
-            "numberOfImages": 1,
-        },
+        "imageGenerationConfig": {"seed": seed, "quality": "standard", "height": 400, "width": 800, "numberOfImages": 1},
     }
 
     try:
@@ -268,164 +239,131 @@ def generate_image():
 
         output_dir = "static/uploads"
         os.makedirs(output_dir, exist_ok=True)
-
-        image_path = output_dir+f"/generated_image_{seed}.png"
+        image_path = os.path.join(output_dir, f"generated_image_{seed}.png")
         with open(image_path, "wb") as file:
             file.write(base64.b64decode(base64_image_data))
 
-        print(f"The generated image has been saved to {image_path}")
-        # return jsonify({"image_url": f"/static/uploads/{os.path.basename(image_path)}"})
-    
-        image_filename = image_path
-
-
-        # **Upload Image to S3**
-        s3_key = f"static/uploads/{image_filename}"
-        s3_op = s3.upload_file(image_path, AWS_BUCKET_NAME, s3_key, ExtraArgs={"ContentType": "image/png"})
-        print("s3_output",s3_op)
-        # **Get S3 Image URL**
+        s3_key = f"uploads/generated_image_{seed}.png"
+        s3.upload_file(image_path, AWS_BUCKET_NAME, s3_key, ExtraArgs={"ContentType": "image/png"})
         s3_image_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{s3_key}"
-        
 
         return jsonify({"image_url": s3_image_url})
-
-    except (ClientError, Exception) as e:
-        print(f"ERROR: Can't generate image. Reason: {e}")
-        return jsonify({"error": "Image generation failed"}), 500
-
-@app.route('/api/static/uploads/<filename>')
-def serve_image(filename):
-    """Serve generated images from output folder."""
-    return f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{filename}"
-
-# **Initialize S3 Client**
-s3 = boto3.client(
-    "s3",region_name=REGION
-    # aws_access_key_id=AWS_ACCESS_KEY,
-    # aws_secret_access_key=AWS_SECRET_KEY
-)
-
-# **Route to Upload HTML to S3**
-@app.route('/api/upload_to_s3', methods=['POST'])
-def upload_to_s3():
-    try:
-        data = request.json
-        user_id = data.get("user_id")
-        html_content = data.get("html_content")
-
-        if not user_id or not html_content:
-            return jsonify({"error": "Missing user_id or HTML content"}), 400
-
-        # **Generate unique filename**
-        file_key = f"webpages/{user_id}.html"
-        print("file_key", file_key)
-        # **Upload HTML file to S3**
-        deo = s3.put_object(Bucket=AWS_BUCKET_NAME, Body=html_content, Key= file_key,ContentType="text/html")
-        print(deo)
-        # **Generate S3 URL**
-        s3_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{file_key}"
-                  
-        return jsonify({"s3_url": s3_url})
-
-    except NoCredentialsError:
-        return jsonify({"error": "AWS Credentials not found"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# **Image Upload Directory Setup**
-UPLOAD_FOLDER = os.path.join(app.root_path, 'static', 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Get Blog Content
+@app.route('/api/get_blog', methods=['GET'])
+@token_required
+def get_blog():
+    user_id = request.args.get('user_id')
+    topic_id = request.args.get('topic_id')
+    print("Received data:", user_id, topic_id)
+    if not user_id or not topic_id:
+        return jsonify({"error": "User ID and Topic ID are required"}), 400
 
-@app.route('/upload_image', methods=['POST'])
-def upload_image():
-    """Handle image uploads."""
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT blog_title, title, introduction, body FROM blogs WHERE user_id = ? AND topic_id = ?", (user_id, topic_id))
+    result = cursor.fetchone()
+    conn.close()
 
-    file = request.files['file']
-    filename = file.filename
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    
-    file.save(file_path)
-    return jsonify({"url": f"/static/uploads/{filename}"})  # Send correct URL to GrapesJS
+    if result:
+        return jsonify({
+            "blog_title": result[0],
+            "title": result[1] or "",
+            "intro": result[2] or "",
+            "body": result[3] or "",
+        })
+    return jsonify({"error": "No blog found"}), 404
 
-@app.route('/static/uploads/<filename>')
-def serve_uploaded_file(filename):
-    """Serve uploaded images."""
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+# Generate Template
+@app.route('/api/generate_template', methods=['POST'])
+@token_required
+def generate_template():
+    data = request.json
+    user_id = data.get("user_id")
+    topic_id = data.get("topic_id")
+    additional_prompt = data.get("additional_prompt", "")
+    print("Received data:", data)
+    if not user_id or not topic_id:
+        return jsonify({"error": "User ID and Topic ID are required"}), 400
 
-# **Route to Save Webpage Code (HTML & CSS)**
+    prompt = """System: Generate a professional blog webpage template using only HTML and CSS.
+                Design requirements:
+                - Clean typography with proper spacing and line height for readability.
+                - Proper visual hierarchy to guide readers through the content.
+                - Should be a visually appealing webpage
+                """ + "Additional elements to include:" + """ IMPORTANT: Your response should ONLY contain the complete HTML and CSS code i.e the response generated should start with <html> and end with </html>. Any explanations, descriptions, or additional information must be ignored included as HTML comments using the format: <!-- Additional information from the model: explanation here -->""" + f"\n\nHuman:{additional_prompt}\n\nAssistant:Webpage code"
+
+    filled_template = invoke_claude(prompt)
+    print("TEMP_OUTPUT", filled_template)
+    return jsonify({"html": filled_template})
+
+# Save Webpage (store in database)
 @app.route('/api/save_webpage', methods=['POST'])
+@token_required
 def save_webpage():
     data = request.json
     user_id = data.get("user_id")
+    topic_id = data.get("topic_id")
     html_content = data.get("html_content")
+    print("Received data:", data)
+    if not all([user_id, topic_id, html_content]):
+        return jsonify({"error": "Missing required fields"}), 400
 
-    if not user_id or not html_content:
-        return jsonify({"error": "Missing user_id or HTML content"}), 400
-    
-    print("WEBPAGE_FOLDER:", app.config.get('WEBPAGE_FOLDER'))  # Debugging line
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM webpages WHERE user_id = ? AND topic_id = ?", (user_id, topic_id))
+    existing_id = cursor.fetchone()
 
-    # **Generate unique filename**
-    file_path = os.path.join(app.config['WEBPAGE_FOLDER'], f"{user_id}.html")
+    if existing_id:
+        cursor.execute("UPDATE webpages SET html_content = ? WHERE id = ?", (html_content, existing_id[0]))
+    else:
+        cursor.execute("INSERT INTO webpages (user_id, topic_id, html_content) VALUES (?, ?, ?)", (user_id, topic_id, html_content))
+    conn.commit()
+    conn.close()
 
+    return jsonify({"success": True})
+
+# Get Webpage Content
+@app.route('/api/get_webpage', methods=['GET'])
+@token_required
+def get_webpage():
+    user_id = request.args.get('user_id')
+    topic_id = request.args.get('topic_id')
+    if not user_id or not topic_id:
+        return jsonify({"error": "User ID and Topic ID are required"}), 400
+
+    conn = sqlite3.connect('blog_content.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT html_content FROM webpages WHERE user_id = ? AND topic_id = ?", (user_id, topic_id))
+    result = cursor.fetchone()
+    print("DB_CONTENT_HTML",result)
+    conn.close()
+
+    if result and result[0]:
+        return jsonify({"html_content": result[0]})
+    return jsonify({"error": "No webpage found"}), 404
+
+# Upload to S3 (for hosting only)
+@app.route('/api/upload_to_s3', methods=['POST'])
+@token_required
+def upload_to_s3():
+    data = request.json
+    user_id = data.get("user_id")
+    topic_id = data.get("topic_id")
+    html_content = data.get("html_content")
+    print("Received data:", data)
+    if not all([user_id, topic_id, html_content]):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    s3_key = f"webpages/{user_id}_{topic_id}.html"
     try:
-        # **Save the webpage locally**
-        with open(file_path, "w", encoding="utf-8") as file:
-            file.write(html_content)
-
-        return jsonify({"message": "Webpage saved successfully!", "file_path": f"/static/webpages/{user_id}.html"})
-    
+        s3.put_object(Bucket=AWS_BUCKET_NAME, Body=html_content, Key=s3_key, ContentType="text/html")
+        s3_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{s3_key}"
+        return jsonify({"s3_url": s3_url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
-# **Route to Serve Saved Webpage Locally**
-@app.route('/static/webpages/<filename>')
-def serve_webpage(filename):
-    """Serve saved webpages from the static/webpages directory."""
-    return send_from_directory(app.config['WEBPAGE_FOLDER'], filename)
-
-
-# **Route to Upload Webpage to S3**
-@app.route('/api/upload_webpage_s3', methods=['POST'])
-def upload_webpage_s3():
-    try:
-        data = request.json
-        user_id = data.get("user_id")
-
-        if not user_id:
-            return jsonify({"error": "User ID is required"}), 400
-
-        # **Get saved webpage path**
-        file_path = os.path.join(app.config['WEBPAGE_FOLDER'], f"{user_id}.html")
-
-        # **Check if the file exists**
-        if not os.path.exists(file_path):
-            return jsonify({"error": "Webpage not found!"}), 404
-
-        # **Read the file content**
-        with open(file_path, "r", encoding="utf-8") as file:
-            html_content = file.read()
-
-        # **Generate unique file key for S3**
-        file_key = f"webpages/{user_id}.html"
-
-        # **Upload HTML file to S3**
-        s3.put_object(Bucket=AWS_BUCKET_NAME, Body=html_content, Key=file_key, ContentType="text/html")
-
-        # **Generate S3 URL**
-        s3_url = f"https://{AWS_BUCKET_NAME}.s3.{REGION}.amazonaws.com/{file_key}"
-
-        return jsonify({"message": "Webpage uploaded successfully!", "s3_url": s3_url})
-
-    except NoCredentialsError:
-        return jsonify({"error": "AWS Credentials not found"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 
 if __name__ == '__main__':
     app.run(debug=True)
