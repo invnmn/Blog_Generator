@@ -1,0 +1,35 @@
+{
+    "name": "@types/ckeditor4",
+    "version": "4.20.7",
+    "description": "TypeScript definitions for ckeditor4",
+    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/ckeditor4",
+    "license": "MIT",
+    "contributors": [
+        {
+            "name": "Thomas Wittwer",
+            "githubUsername": "wittwert",
+            "url": "https://github.com/wittwert"
+        },
+        {
+            "name": "Stuart Long",
+            "githubUsername": "stuartlong",
+            "url": "https://github.com/stuartlong"
+        },
+        {
+            "name": "Enquier",
+            "githubUsername": "enquier",
+            "url": "https://github.com/enquier"
+        }
+    ],
+    "main": "",
+    "types": "index.d.ts",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
+        "directory": "types/ckeditor4"
+    },
+    "scripts": {},
+    "dependencies": {},
+    "typesPublisherContentHash": "b9794b6c15237a1006139f215bd01511e3f5a39181a13c19e4c4f20d2d9e6de1",
+    "typeScriptVersion": "4.5"
+}
