@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from botocore.exceptions import NoCredentialsError, ClientError
 from botocore.config import Config
 from werkzeug.security import generate_password_hash, check_password_hash
-
+from werkzeug.utils import secure_filename
 app = Flask(__name__)
 CORS(app)
 REGION = "us-east-1"
@@ -251,31 +251,74 @@ def generate_image():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Get Blog Content
-@app.route('/api/get_blog', methods=['GET'])
-@token_required
-def get_blog():
-    user_id = request.args.get('user_id')
-    topic_id = request.args.get('topic_id')
-    print("Received data:", user_id, topic_id)
-    if not user_id or not topic_id:
-        return jsonify({"error": "User ID and Topic ID are required"}), 400
+# # Get Blog Content
+# @app.route('/api/get_blog', methods=['GET'])
+# @token_required
+# def get_blog():
+#     user_id = request.args.get('user_id')
+#     topic_id = request.args.get('topic_id')
+#     print("Received data:", user_id, topic_id)
+#     if not user_id or not topic_id:
+#         return jsonify({"error": "User ID and Topic ID are required"}), 400
 
-    conn = sqlite3.connect('blog_content.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT blog_title, title, introduction, body FROM blogs WHERE user_id = ? AND topic_id = ?", (user_id, topic_id))
-    result = cursor.fetchone()
-    conn.close()
+#     conn = sqlite3.connect('blog_content.db')
+#     cursor = conn.cursor()
+#     cursor.execute("SELECT blog_title, title, introduction, body FROM blogs WHERE user_id = ? AND topic_id = ?", (user_id, topic_id))
+#     result = cursor.fetchone()
+#     conn.close()
 
-    if result:
-        return jsonify({
-            "blog_title": result[0],
-            "title": result[1] or "",
-            "intro": result[2] or "",
-            "body": result[3] or "",
-        })
-    return jsonify({"error": "No blog found"}), 404
+#     if result:
+#         return jsonify({
+#             "blog_title": result[0],
+#             "title": result[1] or "",
+#             "intro": result[2] or "",
+#             "body": result[3] or "",
+#         })
+#     return jsonify({"error": "No blog found"}), 404
+# @app.route('/upload_image_to_s3', methods=['POST'])
+# def upload_image_to_s3():
+#     if 'image' not in request.files:
+#         return jsonify({'error': 'No image part'}), 400
+#     file = request.files['image']
+#     if file.filename == '':
+#         return jsonify({'error': 'No selected file'}), 400
 
+#     if file:
+#         output_dir = "static/uploads"
+#         filename = secure_filename(file.filename)
+#         os.makedirs(output_dir, exist_ok=True)
+#         image_path = os.path.join(output_dir, filename)
+
+#         s3_key = f"uploads/{filename}"
+#         s3.upload_file(image_path, AWS_BUCKET_NAME, s3_key)
+#         image_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{s3_key}"
+#         # filename = secure_filename(file.filename)
+#         # file_path = os.path.join(UPLOAD_FOLDER, filename)
+#         # s3.upload_file(file, BUCKET_NAME, file_path)
+#         # image_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{file_path}"
+#         return jsonify({'image_url': image_url})
+
+@app.route('/api/upload_image_to_s3', methods=['POST'])
+@token_required  # Add token authentication to match frontend
+def upload_image_to_s3():
+    print("L1")
+    if 'image' not in request.files:
+        print("L2")
+        return jsonify({'error': 'No image part'}), 400
+    file = request.files['image']
+    if file.filename == '':
+        print("L3")
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file:
+        print("L4")
+        filename = secure_filename(file.filename)
+        print("FILENAME",filename)
+        s3_key = f"uploads/{filename}"
+        img_upld = s3.upload_fileobj(file, AWS_BUCKET_NAME, s3_key, ExtraArgs={"ContentType": file.content_type})
+        print("IMAGE UPLOAD",img_upld)
+        image_url = f"https://s3.{REGION}.amazonaws.com/{AWS_BUCKET_NAME}/{s3_key}"
+        return jsonify({'image_url': image_url})
 # Generate Template
 @app.route('/api/generate_template', methods=['POST'])
 @token_required
@@ -292,8 +335,14 @@ def generate_template():
                 Design requirements:
                 - Clean typography with proper spacing and line height for readability.
                 - Proper visual hierarchy to guide readers through the content.
-                - Should be a visually appealing webpage
-                """ + "Additional elements to include:" + """ IMPORTANT: Your response should ONLY contain the complete HTML and CSS code i.e the response generated should start with <html> and end with </html>. Any explanations, descriptions, or additional information must be ignored included as HTML comments using the format: <!-- Additional information from the model: explanation here -->""" + f"\n\nHuman:{additional_prompt}\n\nAssistant:Webpage code"
+                - Should be a visually appealing webpage.
+                - Do not include any hyperlinks unless I explicitly mention them in the input. 
+                - Do NOT include any of the following unless I specifically mention them in my input:
+                    Hyperlinks (i.e., <a href="..."> tags)
+                    Text links
+                    Buttons that link to other pages (e.g., CTA buttons with links or navigation)
+                    This blog is meant to be self-contained. Use only plain text and images. No external references, links, or navigation elements unless requested.
+                """ + """ IMPORTANT: Your response should ONLY contain the complete HTML and CSS code i.e the response generated should start with <html> and end with </html>. Any explanations, descriptions, or additional information must be ignored included as HTML comments using the format: <!-- Additional information from the model: explanation here -->""" + f"\n\nHuman:{additional_prompt}\n\nAssistant:Webpage code"
 
     filled_template = invoke_claude(prompt)
     print("TEMP_OUTPUT", filled_template)
@@ -329,8 +378,11 @@ def save_webpage():
 @app.route('/api/get_webpage', methods=['GET'])
 @token_required
 def get_webpage():
+    # data =request.json
+    # print("REQUEST FOR WEBPAGE ",data)
     user_id = request.args.get('user_id')
     topic_id = request.args.get('topic_id')
+    print(f"USERID = {user_id} AND TOPICID  = {topic_id}")
     if not user_id or not topic_id:
         return jsonify({"error": "User ID and Topic ID are required"}), 400
 
